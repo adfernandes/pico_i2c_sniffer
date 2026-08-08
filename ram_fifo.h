@@ -43,3 +43,12 @@ bool ram_fifo_set(uint32_t item);
  * \return 32 bit unsigned data from the FIFO.
  */
 uint32_t ram_fifo_get(void);
+
+/*! \brief Check if the FIFO level.
+ *  \ingroup ram_fifo
+ *
+ * This function don't block.
+ *
+ * \return 32 bit unsigned level of FIFO.
+ */
+uint32_t ram_fifo_get_level(void);

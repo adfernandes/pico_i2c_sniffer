@@ -1,7 +1,18 @@
-.define PUBLIC SDA_PIN     0    ; Input for i2c data.
-.define PUBLIC EV0_PIN     1    ; Input/Output for bit 0 of event code.
-.define PUBLIC EV1_PIN     2    ; Input/Output for bit 1 of event code.
-.define PUBLIC SCL_PIN     3    ; Input for i2c clock.
+; i2c_sniffer.pio.in
+;
+; Template processed by CMake (configure_file) to generate i2c_sniffer.pio
+; with the pin map of the selected target baked in. See CMakeLists.txt:
+;
+;   Standard Pico / Pico 2 (legacy 2021): SDA=0, EV0=1, EV1=2, SCL=3
+;   Bus Pirate 5:                         SDA=15 (IO7), EV0=16, EV1=17, SCL=8 (IO0)
+;
+; NOTE: the INT spy pin is NOT baked here, the int_spy program uses
+; pin-relative WAIT instructions and the pin is configured at run time.
+
+.define PUBLIC SDA_PIN     @I2C_SDA_PIN@    ; Input for i2c data.
+.define PUBLIC EV0_PIN     @I2C_EV0_PIN@    ; Input/Output for bit 0 of event code.
+.define PUBLIC EV1_PIN     @I2C_EV1_PIN@    ; Input/Output for bit 1 of event code.
+.define PUBLIC SCL_PIN     @I2C_SCL_PIN@    ; Input for i2c clock.
 
 .define PUBLIC IRQ_EVENT   7    
 
@@ -81,6 +92,21 @@ wait_irq_event:
 send_event:
     mov isr, pins           ; Load the EV1(3), EV0(1), SDA(0). 
     in NULL, 9              ; The event code starts at bit 11 and ends at 12.
+.wrap
+
+.program int_spy
+
+; Watches the interrupt (INT) output of an I2C peripheral (open-drain, active
+; low) and reports every edge: pushes a 0 word on the falling edge (INT
+; asserted) and a 1 word on the rising edge (INT released).
+; The watched pin is configured as the JMP pin at run time, so pin-relative
+; WAIT instructions are used and no GPIO number is baked into the code.
+
+.wrap_target
+    wait 0 pin 0            ; Falling edge: INT asserted.
+    in pins, 1              ; Push the sampled level (0).
+    wait 1 pin 0            ; Rising edge: INT released.
+    in pins, 1              ; Push the sampled level (1).
 .wrap
 
 % c-sdk {
@@ -219,6 +245,47 @@ void i2c_main_program_init(PIO pio, uint sm, uint offset, float div) {
     
     // I2C is MSB first then: shift to left, auto push, threshold = 8 datos + 1 ack
     sm_config_set_in_shift(&c, false, true, 9);
+
+    // It doubles the depth of the FIFO, because it also uses the transmitting one.
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    // Set the clock divider for the state machine
+    sm_config_set_clkdiv(&c, div);
+
+    // Load configuration and jump to start of the program
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+%}
+
+% c-sdk {
+
+// Helper function (for use in C program) to initialize the INT spy program.
+// The pin is a run-time parameter: no GPIO number is baked into the program.
+void int_spy_program_init(PIO pio, uint sm, uint offset, uint pin, float div) {
+
+    // Sets up state machine and wrap target. This function is automatically
+    // generated in i2c_sniffer.pio.h.
+    pio_sm_config c = int_spy_program_get_default_config(offset);
+
+    pio_gpio_init(pio, pin);
+    gpio_set_dir(pin, GPIO_IN);
+    // INT lines are open-drain (active low): the pull-up keeps the pin quiet
+    // when it is left unconnected, so the spy stays inert and no spurious
+    // events are generated.
+    gpio_pull_up(pin);
+
+    // Sample the INT pin with 'in pins, 1'.
+    sm_config_set_in_pins(&c, pin);
+
+    // The WAIT PIN instructions are relative to the JMP pin.
+    sm_config_set_jmp_pin(&c, pin);
+
+    // INT pin direction to input (in PIO).
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+
+    // Auto push every sampled edge (threshold = 1 bit).
+    sm_config_set_in_shift(&c, false, true, 1);
 
     // It doubles the depth of the FIFO, because it also uses the transmitting one.
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
