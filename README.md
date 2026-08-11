@@ -240,16 +240,22 @@ NAND flash is held deselected at boot for this reason.
 
 ### INT channel output
 
-INT edges are printed on their own line, timestamped with `time_us_32()`:
+INT edges are printed on their own line, timestamped with `time_us_32()`
+(100 us resolution):
 
 ```
-[INT asserted] t=0012345678
+[INT asserted] t=0012345700
 s B2a 02a s B3a 60a 00a FFa 3Fn p
-[INT released] t=0012351234
+[INT released] t=0012351200
 ```
 
 `asserted` = falling edge (INT low, open-drain active-low line), `released` =
 rising edge. With the INT pin unconnected no such lines are emitted.
+
+Each edge travels as a single 32-bit word (tag + level + timestamp), so the
+event is atomic in the capture FIFO and cannot lose sync with a companion
+word. Lines that fall inside an I2C frame are held and printed after the
+frame's `p`, so frame printouts are never split mid-line.
 
 ### Overflow diagnostics
 

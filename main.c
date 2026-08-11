@@ -80,10 +80,17 @@
     #define LED_PIN                 25
 #endif
 
-// INT event packing: bit 31 marks an INT event (I2C events never set it,
-// their highest used bit is 12), bit 28 carries the line level after the edge.
+// INT event packing: a single 32-bit word per edge, so the event is atomic
+// in the FIFO and can never lose sync with a companion word (the v1
+// tag+timestamp pair could desync under backpressure and eat i2c words).
+// Bit 31 marks an INT event (i2c events never set it, their highest used
+// bit is 12), bit 30 carries the line level after the edge, and bits 29..0
+// carry time_us_32()/100 (time_us_32 wraps at ~71.6 min, so the value
+// always fits; console timestamps recover microsecond units, 100 us
+// resolution).
 #define EV_INT_TAG              0x80000000u
-#define EV_INT_LEVEL            (1u << 28)
+#define EV_INT_LEVEL            (1u << 30)
+#define EV_INT_TS_MASK          0x3FFFFFFFu
 
 #define RAM_FIFO_SIZE           40000
 
@@ -274,16 +281,41 @@ static void init_pins(void) {
  *
  * \return void.
  */
+#if INT_CAPTURE_EN
+/*! \brief Print the held INT lines, in arrival order.
+ *  \ingroup main
+ *
+ * INT edge lines are printed outside of i2c frames so they never split a
+ * frame printout.
+ */
+static inline void int_lines_flush(const bool *levels, const uint32_t *tss,
+                                   uint8_t *count) {
+    for (uint8_t i = 0; i < *count; i++) {
+        printf("[INT %s] t=%010lu\r\n", levels[i] ? "released" : "asserted",
+               (unsigned long)tss[i]);
+    }
+    *count = 0;
+}
+#endif
+
 void core1_print() {
     uint32_t val;
 #ifdef PRINT_HEX_INDEX
     uint32_t capture_index = 0;
 #endif
 #if INT_CAPTURE_EN
-    // The INT spy emits a (tag, timestamp) word pair per edge.
-    bool int_ts_pending = false;
-    bool int_level = false;
+    // Each INT edge arrives as a single self-contained word. The printed
+    // line is held while an i2c frame is open so it never splits a frame
+    // printout; held lines flush in order on the frame's STOP or as soon
+    // as the bus goes idle. Depth 4 is plenty: an i2c frame lasts ~ms and
+    // INT pulses are ~5.5 ms, so two edges per frame is the realistic
+    // worst case.
+    #define INT_HOLD_QSIZE        4
+    bool int_hold_level[INT_HOLD_QSIZE];
+    uint32_t int_hold_ts[INT_HOLD_QSIZE];
+    uint8_t int_hold_count = 0;
 #endif
+    bool frame_open = false;
     bool overflow_reported = false;
     
     printf("i2c sniffer pico initialiced!\r\n");
@@ -294,6 +326,14 @@ void core1_print() {
         // and there is a string stored in the buffer, it sends it.
         if (!multicore_fifo_pop_timeout_us(100, &val)) {
             buff_print();
+
+#if INT_CAPTURE_EN
+            // Bus idle: held INT lines can be printed now (a frame in
+            // progress keeps them held until its STOP).
+            if (!frame_open) {
+                int_lines_flush(int_hold_level, int_hold_ts, &int_hold_count);
+            }
+#endif
 
             if (ram_fifo_overflow && !overflow_reported) {
                 printf("[WARN] RAM FIFO overflow - capture loss (peak level %lu)\r\n",
@@ -309,17 +349,16 @@ void core1_print() {
 
 #if INT_CAPTURE_EN
         if (val & EV_INT_TAG) {
-            int_level = (val & EV_INT_LEVEL) != 0;
-            int_ts_pending = true;
-            continue;                    // The next word carries the timestamp.
-        }
+            if (int_hold_count < INT_HOLD_QSIZE) {
+                int_hold_level[int_hold_count] = (val & EV_INT_LEVEL) != 0;
+                int_hold_ts[int_hold_count] = (val & EV_INT_TS_MASK) * 100u;
+                int_hold_count++;
+            }   // Queue full: drop (practically unreachable, see sizing note).
 
-        if (int_ts_pending) {
-            buff_print();
-            printf("[INT %s] t=%010lu\r\n", int_level ? "released" : "asserted",
-                   (unsigned long)val);
-            int_ts_pending = false;
-            continue;
+            if (!frame_open) {
+                int_lines_flush(int_hold_level, int_hold_ts, &int_hold_count);
+            }
+            continue;                    // Held while a frame is printing.
         }
 #endif
 
@@ -334,6 +373,7 @@ void core1_print() {
         printf("val: %x, ev_code: %x, data:%x, ack: %d \r\n", val, ev_code, data, ack);
 #else
         if (ev_code == EV_START) {
+            frame_open = true;
 #if defined(PRINT_TIME_T)
             printf("%010lu ", time_us_32());
 #elif defined(PRINT_HEX_INDEX)
@@ -345,6 +385,10 @@ void core1_print() {
             buff_putchar('\r');
             buff_putchar('\n');
             buff_print();
+            frame_open = false;
+#if INT_CAPTURE_EN
+            int_lines_flush(int_hold_level, int_hold_ts, &int_hold_count);
+#endif
         } else if (ev_code == EV_DATA) {
             buff_putchar(nibble_to_hex(data>>4));
             buff_putchar(nibble_to_hex(data));
@@ -432,13 +476,15 @@ int main()
         }
 
 #if INT_CAPTURE_EN
-        // Drain the INT spy FIFO, expanding each edge into a (tag, timestamp)
-        // word pair so the console can correlate it with the i2c frames.
+        // Drain the INT spy FIFO, packing each edge into a single 32-bit
+        // word (tag + level + timestamp) so the event stays atomic in the
+        // RAM FIFO and the console can correlate it with the i2c frames.
         while (pio_sm_get_rx_fifo_level(pio_int, sm_int) > 0) {
             uint32_t level = pio_sm_get(pio_int, sm_int) & 1u;
+            uint32_t ev = EV_INT_TAG | (level ? EV_INT_LEVEL : 0u) |
+                          ((time_us_32() / 100u) & EV_INT_TS_MASK);
 
-            if (!ram_fifo_set(EV_INT_TAG | (level ? EV_INT_LEVEL : 0)) ||
-                !ram_fifo_set(time_us_32())) {
+            if (!ram_fifo_set(ev)) {
                 fifo_overflow_counter++;
                 ram_fifo_overflow = true;
             }
